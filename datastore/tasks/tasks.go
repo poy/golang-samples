@@ -17,101 +17,128 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
-	"strings"
-	"text/tabwriter"
 	"time"
 
 	"cloud.google.com/go/datastore"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 )
 
 func main() {
-	projID := os.Getenv("DATASTORE_PROJECT_ID")
-	if projID == "" {
-		log.Fatal(`You need to set the environment variable "DATASTORE_PROJECT_ID"`)
+	creds, err := parseCreds()
+	if err != nil {
+		log.Fatalf("failed to parse creds: %s", err)
 	}
-	// [START datastore_build_service]
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Printf("Starting datastore task list on port %s", port)
+
 	ctx := context.Background()
-	client, err := datastore.NewClient(ctx, projID)
-	// [END datastore_build_service]
+	client, err := datastore.NewClient(ctx, datastore.DetectProjectID, option.WithCredentials(creds))
 	if err != nil {
 		log.Fatalf("Could not create datastore client: %v", err)
 	}
 
-	// Print welcome message.
-	fmt.Println("Cloud Datastore Task List")
-	fmt.Println()
-	usage()
-
-	// Read commands from stdin.
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Print("> ")
-
-	for scanner.Scan() {
-		cmd, args, n := parseCmd(scanner.Text())
-		switch cmd {
-		case "new":
-			if args == "" {
-				log.Printf("Missing description in %q command", cmd)
-				usage()
-				break
-			}
-			key, err := AddTask(ctx, client, args)
-			if err != nil {
-				log.Printf("Failed to create task: %v", err)
-				break
-			}
-			fmt.Printf("Created new task with ID %d\n", key.ID)
-
-		case "done":
-			if n == 0 {
-				log.Printf("Missing numerical task ID in %q command", cmd)
-				usage()
-				break
-			}
-			if err := MarkDone(ctx, client, n); err != nil {
-				log.Printf("Failed to mark task done: %v", err)
-				break
-			}
-			fmt.Printf("Task %d marked done\n", n)
-
-		case "list":
+	log.Fatal(http.ListenAndServe(":"+port, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// List
 			tasks, err := ListTasks(ctx, client)
 			if err != nil {
-				log.Printf("Failed to fetch task list: %v", err)
-				break
+				log.Printf("failed to read from datastore: %s", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "failed to read from datastore: %s", err)
+				return
 			}
-			PrintTasks(os.Stdout, tasks)
+			json.NewEncoder(w).Encode(tasks)
+		case http.MethodPost:
+			// New
+			data, err := readMsg(r.Body)
+			if err != nil {
+				log.Printf("failed to read message: %s", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "failed to read message: %s", err)
+				return
+			}
 
-		case "delete":
-			if n == 0 {
-				log.Printf("Missing numerical task ID in %q command", cmd)
-				usage()
-				break
+			key, err := AddTask(ctx, client, data)
+			if err != nil {
+				log.Printf("failed to create task: %s", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "failed to create task: %s", err)
+				return
 			}
-			if err := DeleteTask(ctx, client, n); err != nil {
-				log.Printf("Failed to delete task: %v", err)
-				break
+			fmt.Fprintf(w, "created new task with ID %d\n", key.ID)
+		case http.MethodDelete:
+			// Delete
+			idStr, err := readMsg(r.Body)
+			if err != nil {
+				log.Printf("failed to read message: %s", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "failed to read message: %s", err)
+				return
 			}
-			fmt.Printf("Task %d deleted\n", n)
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, "failed to parse ID (must be int64): %s", err)
+				return
+			}
 
+			if err := MarkDone(ctx, client, id); err != nil {
+				log.Printf("failed to mark task done: %s", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "failed to mark task done: %s", err)
+			}
+			fmt.Fprintf(w, "task %d marked done\n", id)
 		default:
-			log.Printf("Unknown command %q", cmd)
-			usage()
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
+	})))
+}
 
-		fmt.Print("> ")
+func parseCreds() (*google.Credentials, error) {
+	serviceName := os.Getenv("SERVICE_NAME")
+	if serviceName == "" {
+		return nil, errors.New("SERVICE_NAME is required. It tells us which to use to connect to datastore")
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Fatalf("Failed reading stdin: %v", err)
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(os.Getenv("VCAP_SERVICES")), &m); err != nil {
+		return nil, err
 	}
+
+	c, ok := m[serviceName].(map[string]interface{})["credentials"]
+	if !ok {
+		return nil, fmt.Errorf("%s service does not have credentials", serviceName)
+	}
+
+	jc, err := base64.StdEncoding.DecodeString(c.(map[string]interface{})["PrivateKeyData"].(string))
+	if err != nil {
+		return nil, fmt.Errorf("failed to base64 decode credentials: %s", err)
+	}
+
+	creds, err := google.CredentialsFromJSON(context.Background(), jc, "https://www.googleapis.com/auth/datastore")
+	if err != nil {
+		return nil, err
+	}
+
+	return creds, nil
 }
 
 // [START datastore_add_entity]
@@ -120,7 +147,7 @@ type Task struct {
 	Desc    string    `datastore:"description"`
 	Created time.Time `datastore:"created"`
 	Done    bool      `datastore:"done"`
-	id      int64     // The integer ID used in the datastore.
+	Id      int64     `datastore:"id"` // The integer ID used in the datastore.
 }
 
 // AddTask adds a task with the given description to the datastore,
@@ -171,7 +198,7 @@ func ListTasks(ctx context.Context, client *datastore.Client) ([]*Task, error) {
 
 	// Set the id field on each Task from the corresponding key.
 	for i, key := range keys {
-		tasks[i].id = key.ID
+		tasks[i].Id = key.ID
 	}
 
 	return tasks, nil
@@ -185,42 +212,11 @@ func DeleteTask(ctx context.Context, client *datastore.Client, taskID int64) err
 	return client.Delete(ctx, datastore.IDKey("Task", taskID, nil))
 }
 
-// [END datastore_delete_entity]
-
-// PrintTasks prints the tasks to the given writer.
-func PrintTasks(w io.Writer, tasks []*Task) {
-	// Use a tab writer to help make results pretty.
-	tw := tabwriter.NewWriter(w, 8, 8, 1, ' ', 0) // Min cell size of 8.
-	fmt.Fprintf(tw, "ID\tDescription\tStatus\n")
-	for _, t := range tasks {
-		if t.Done {
-			fmt.Fprintf(tw, "%d\t%s\tdone\n", t.id, t.Desc)
-		} else {
-			fmt.Fprintf(tw, "%d\t%s\tcreated %v\n", t.id, t.Desc, t.Created)
-		}
+func readMsg(r io.Reader) (string, error) {
+	var buf bytes.Buffer
+	if _, err := io.CopyN(&buf, r, 256); err != nil && err != io.EOF {
+		return "", err
 	}
-	tw.Flush()
-}
 
-func usage() {
-	fmt.Print(`Usage:
-
-  new <description>  Adds a task with a description <description>
-  done <task-id>     Marks a task as done
-  list               Lists all tasks by creation time
-  delete <task-id>   Deletes a task
-`)
-}
-
-// parseCmd splits a line into a command and optional extra args.
-// n will be set if the extra args can be parsed as an int64.
-func parseCmd(line string) (cmd, args string, n int64) {
-	if f := strings.Fields(line); len(f) > 0 {
-		cmd = f[0]
-		args = strings.Join(f[1:], " ")
-	}
-	if i, err := strconv.ParseInt(args, 10, 64); err == nil {
-		n = i
-	}
-	return cmd, args, n
+	return buf.String(), nil
 }
